@@ -40,11 +40,78 @@ MMS_CLAT_DEV = "clat-mms"
 MMS_CLAT_V4_ADDR = "192.0.0.2"
 MMS_ROUTE_TABLE = 49576
 
+# TAYGA copies the IPv4 TTL into the IPv6 hop limit and decrements it on
+# translation, so CLAT traffic leaves with a hop limit two below whatever the
+# originating stack used - 62 for a Linux default of 64, and lower still for
+# anything forwarded, such as a Wi-Fi hotspot client that was already
+# decremented on the way in.
+#
+# At least one carrier (T-Mobile US, observed) drops translated packets below a
+# hop limit of 64: measured 0/5 success at 60, 62 and 63 against 5/5 at 64 and
+# 65, while the reply path shows the NAT64 only ~13 hops away, so the packets
+# are not expiring - they are being filtered. Traffic from the host's own stack
+# is unaffected because the carrier's router advertisement sets a hop limit of
+# 255.
+#
+# Normalizing egress to 255 puts translated packets on the same footing as
+# everything else the device sends. Doing it here rather than via
+# net.ipv4.ip_default_ttl is deliberate: this covers forwarded traffic, which
+# arrives already decremented and which the sysctl cannot reach.
+HOPLIMIT_TABLE = "clatd-hoplimit"
+EGRESS_HOPLIMIT = 255
+
 CLATD_UNIT_RE = re.compile(r"^clatd@(.*)\.service$")
 IP6_RULE_RE = re.compile(r"from (\S+) to (\S+) fwmark")
 
 def run_ip(*args):
     subprocess.run(["ip", *args], capture_output=True)
+
+def run_nft(script):
+    return subprocess.run(
+        ["nft", "-f", "-"], input=script, capture_output=True, text=True
+    ).returncode == 0
+
+def hoplimit_rule_current(iface, prefix):
+    result = subprocess.run(
+        ["nft", "list", "table", "ip6", HOPLIMIT_TABLE], capture_output=True, text=True
+    )
+    if result.returncode != 0:
+        return False
+
+    return all(
+        token in result.stdout
+        for token in (f'oif "{iface}"', prefix, f"hoplimit set {EGRESS_HOPLIMIT}")
+    )
+
+def ensure_hoplimit_normalization(iface, prefix):
+    """
+    Normalize the hop limit of everything leaving iface for the PLAT prefix.
+
+    This lives in its own table rather than in clatd's, because clatd rebuilds
+    its table from scratch on every start and would drop a chain added there.
+    The add/delete pair in front is the standard idiom for replacing a table
+    atomically - the add makes the delete safe when the table does not exist
+    yet, and nft applies the whole script as one transaction.
+
+    Checked before writing so the repeated dispatcher invocations that happen
+    during a reconnect do not re-touch nftables state that is already correct.
+    """
+    if not prefix or hoplimit_rule_current(iface, prefix):
+        return
+
+    run_nft(
+        f"add table ip6 {HOPLIMIT_TABLE}\n"
+        f"delete table ip6 {HOPLIMIT_TABLE}\n"
+        f"table ip6 {HOPLIMIT_TABLE} {{\n"
+        f"  chain postrouting {{\n"
+        f"    type filter hook postrouting priority mangle; policy accept;\n"
+        f'    oif "{iface}" ip6 daddr {prefix} ip6 hoplimit set {EGRESS_HOPLIMIT}\n'
+        f"  }}\n"
+        f"}}\n"
+    )
+
+def clear_hoplimit_normalization():
+    run_nft(f"add table ip6 {HOPLIMIT_TABLE}\ndelete table ip6 {HOPLIMIT_TABLE}\n")
 
 def ipv6_global_addr(iface):
     result = subprocess.run(
@@ -346,6 +413,11 @@ def manage_cellular(iface, systemd, dns64_servers):
             ensure_nat64_prefix_routes(iface, prefix)
             routed_prefix = prefix
 
+        # Re-checked every pass rather than only when the prefix changes: each
+        # restart below rebuilds clatd's own state, and the interface can be
+        # renamed out from under us mid-window.
+        ensure_hoplimit_normalization(iface, prefix)
+
         real_addr = ipv6_global_addr(iface)
         if not real_addr:
             continue
@@ -407,6 +479,10 @@ def main():
 
         if cellular_iface:
             manage_cellular(cellular_iface, systemd, cellular_dns64)
+        else:
+            # No cellular bearer, so no CLAT egress to normalize. Drop the rule
+            # rather than leave one pinned to an interface that is gone.
+            clear_hoplimit_normalization()
     except dbus.exceptions.DBusException as error:
         print(f"clatd-bearer-manager: D-Bus error: {error}", file=sys.stderr)
 
